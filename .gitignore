@@ -17,6 +17,7 @@ codes/node_extraction_using_neo4j.ipynb
 neighborhood.svg
 .DS_Store
 .ipynb_checkpoints/
+.idea/
 spoke_gpt_prompt_1.txt
 *.pptx
 codes/generate_textual_knowledge_DaG.ipynb
