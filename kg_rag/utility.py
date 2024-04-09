@@ -18,6 +18,8 @@ from transformers import pipeline, AutoTokenizer, AutoModelForCausalLM, TextStre
 from kg_rag.config_loader import *
 import ast
 import requests
+from pathlib import Path
+from typing import Optional
 
 memory = Memory("cachegpt", verbose=0)
 
@@ -143,28 +145,62 @@ def get_prompt(instruction, new_system_prompt):
     prompt_template =  B_INST + system_prompt + instruction + E_INST
     return prompt_template
 
-def llama_model(model_name, branch_name, cache_dir, temperature=0, top_p=1, max_new_tokens=512, stream=False, method='method-1'):
+def get_model_path(model_name: str, cache_dir: str, type: str = None) -> Optional[str]:
+    # if type in MODEL_PATH:
+    #     paths = MODEL_PATH[type]
+    # else:
+    #     paths = {}
+    #     for v in MODEL_PATH.values():
+    #         paths.update(v)
+
+    # if path_str := paths.get(model_name):  # 以 "chatglm-6b": "THUDM/chatglm-6b-new" 为例，以下都是支持的路径
+    path_str = model_name
+    if bool(path_str):
+        path = Path(path_str)
+        if path.is_dir():  # 任意绝对路径
+            return str(path)
+
+        root_path = Path(cache_dir)
+        if root_path.is_dir():
+            path = root_path / model_name
+            if path.is_dir():  # use key, {MODEL_ROOT_PATH}/chatglm-6b
+                return str(path)
+            path = root_path / path_str
+            if path.is_dir():  # use value, {MODEL_ROOT_PATH}/THUDM/chatglm-6b-new
+                return str(path)
+            path = root_path / path_str.split("/")[-1]
+            if path.is_dir():  # use value split by "/", {MODEL_ROOT_PATH}/chatglm-6b-new
+                return str(path)
+        return path_str  # THUDM/chatglm06b
+
+def llama_model(model_name, branch_name, cache_dir, hf_token=None, temperature=0, top_p=1, max_new_tokens=512, stream=False, method='method-1'):
+    model_name_path = get_model_path(model_name, cache_dir, type='llama')
+
     if method == 'method-1':
-        tokenizer = AutoTokenizer.from_pretrained(model_name,
-                                                 revision=branch_name,
-                                                 cache_dir=cache_dir)
-        model = AutoModelForCausalLM.from_pretrained(model_name,                                             
+        tokenizer = AutoTokenizer.from_pretrained(model_name_path,
+                                                  revision=branch_name,
+                                                  # cache_dir=cache_dir,
+                                                  use_auth_token=hf_token
+                                                  )
+        model = AutoModelForCausalLM.from_pretrained(model_name_path,
                                             device_map='auto',
                                             torch_dtype=torch.float16,
                                             revision=branch_name,
-                                            cache_dir=cache_dir
+                                            # cache_dir=cache_dir,
+                                            use_auth_token=hf_token
                                             )
     elif method == 'method-2':
         import transformers
-        tokenizer = transformers.LlamaTokenizer.from_pretrained(model_name, 
+        tokenizer = transformers.LlamaTokenizer.from_pretrained(model_name,
                                                                 revision=branch_name, 
-                                                                cache_dir=cache_dir, 
+                                                                cache_dir=cache_dir,
                                                                 legacy=False)
-        model = transformers.LlamaForCausalLM.from_pretrained(model_name, 
+        model = transformers.LlamaForCausalLM.from_pretrained(model_name,
                                                               device_map='auto', 
                                                               torch_dtype=torch.float16, 
                                                               revision=branch_name, 
-                                                              cache_dir=cache_dir)        
+                                                              cache_dir=cache_dir
+                                                              )
     if not stream:
         pipe = pipeline("text-generation",
                     model = model,
@@ -250,75 +286,112 @@ def disease_entity_extractor_v2(text):
     except:
         return None
     
+def load_sentence_transformer(sentence_embedding_model, cache_folder=None):
+    model_path = get_model_path(sentence_embedding_model, cache_folder)
+    return SentenceTransformerEmbeddings(model_name=model_path,  model_kwargs={'device': 'cpu'})
 
-def load_sentence_transformer(sentence_embedding_model):
-    return SentenceTransformerEmbeddings(model_name=sentence_embedding_model)
-
-def load_chroma(vector_db_path, sentence_embedding_model):
-    embedding_function = load_sentence_transformer(sentence_embedding_model)
+def load_chroma(vector_db_path, sentence_embedding_model, cache_folder):
+    embedding_function = load_sentence_transformer(sentence_embedding_model, cache_folder)
     return Chroma(persist_directory=vector_db_path, embedding_function=embedding_function)
 
 def retrieve_context(question, vectorstore, embedding_function, node_context_df, context_volume, context_sim_threshold, context_sim_min_threshold, edge_evidence, api=True):
+    # Extract disease entities from the question by calling GPT-3.5-Turbo
     entities = disease_entity_extractor_v2(question)
+    # initialize an empty list to store the context of the nodes
     node_hits = []
     if entities:
+        # compute the maximum number of high similarity context per node according to number of entities
         max_number_of_high_similarity_context_per_node = int(context_volume/len(entities))
+        # find the most similar node in SPOKE for each entity
         for entity in entities:
             node_search_result = vectorstore.similarity_search_with_score(entity, k=1)
+            # store the node name in the list
             node_hits.append(node_search_result[0][0].page_content)
+        # generate the question embedding
         question_embedding = embedding_function.embed_query(question)
+        #
         node_context_extracted = ""
+
+        #
         for node_name in node_hits:
             if not api:
                 node_context = node_context_df[node_context_df.node_name == node_name].node_context.values[0]
             else:
+                # get the context of the node using SPOKE API
                 node_context,context_table = get_context_using_spoke_api(node_name)
-            node_context_list = node_context.split(". ")        
+            # split the context into sentences by '.'
+            node_context_list = node_context.split(". ")
+            # generate the embeddings for each sentence in the context
             node_context_embeddings = embedding_function.embed_documents(node_context_list)
+            # compute the cosine similarity between the question embedding and each sentence embedding in the context
             similarities = [cosine_similarity(np.array(question_embedding).reshape(1, -1), np.array(node_context_embedding).reshape(1, -1)) for node_context_embedding in node_context_embeddings]
+            # sort the similarities in descending order
             similarities = sorted([(e, i) for i, e in enumerate(similarities)], reverse=True)
+            # compute 75 percentile of the similarities
             percentile_threshold = np.percentile([s[0] for s in similarities], context_sim_threshold)
+            # filter the indices of the contexts with similarity greater than the percentile threshold and minimum similarity threshold
             high_similarity_indices = [s[1] for s in similarities if s[0] > percentile_threshold and s[0] > context_sim_min_threshold]
+            # truncate the high similarity indices to the maximum number of high similarity context per node
             if len(high_similarity_indices) > max_number_of_high_similarity_context_per_node:
                 high_similarity_indices = high_similarity_indices[:max_number_of_high_similarity_context_per_node]
-            high_similarity_context = [node_context_list[index] for index in high_similarity_indices]            
+            # extract the high similarity context
+            high_similarity_context = [node_context_list[index] for index in high_similarity_indices]
+            #
             if edge_evidence:
                 high_similarity_context = list(map(lambda x:x+'.', high_similarity_context)) 
                 context_table = context_table[context_table.context.isin(high_similarity_context)]
                 context_table.loc[:, "context"] =  context_table.source + " " + context_table.predicate.str.lower() + " " + context_table.target + " and Provenance of this association is " + context_table.provenance + " and attributes associated with this association is in the following JSON format:\n " + context_table.evidence.astype('str') + "\n\n"                
                 node_context_extracted = context_table.context.str.cat(sep=' ')
             else:
+                #
                 node_context_extracted += ". ".join(high_similarity_context)
                 node_context_extracted += ". "
         return node_context_extracted
     else:
+        #
         node_hits = vectorstore.similarity_search_with_score(question, k=5)
+        #
         max_number_of_high_similarity_context_per_node = int(context_volume/5)
+        #
         question_embedding = embedding_function.embed_query(question)
+        #
         node_context_extracted = ""
+        #
         for node in node_hits:
+            #
             node_name = node[0].page_content
             if not api:
                 node_context = node_context_df[node_context_df.node_name == node_name].node_context.values[0]
             else:
                 node_context, context_table = get_context_using_spoke_api(node_name)
-            node_context_list = node_context.split(". ")        
+            #
+            node_context_list = node_context.split(". ")
+            #
             node_context_embeddings = embedding_function.embed_documents(node_context_list)
+            #
             similarities = [cosine_similarity(np.array(question_embedding).reshape(1, -1), np.array(node_context_embedding).reshape(1, -1)) for node_context_embedding in node_context_embeddings]
+            #
             similarities = sorted([(e, i) for i, e in enumerate(similarities)], reverse=True)
+            #
             percentile_threshold = np.percentile([s[0] for s in similarities], context_sim_threshold)
+            #
             high_similarity_indices = [s[1] for s in similarities if s[0] > percentile_threshold and s[0] > context_sim_min_threshold]
+            #
             if len(high_similarity_indices) > max_number_of_high_similarity_context_per_node:
                 high_similarity_indices = high_similarity_indices[:max_number_of_high_similarity_context_per_node]
+            #
             high_similarity_context = [node_context_list[index] for index in high_similarity_indices]
+            #
             if edge_evidence:
                 high_similarity_context = list(map(lambda x:x+'.', high_similarity_context))
                 context_table = context_table[context_table.context.isin(high_similarity_context)]
                 context_table.loc[:, "context"] =  context_table.source + " " + context_table.predicate.str.lower() + " " + context_table.target + " and Provenance of this association is " + context_table.provenance + " and attributes associated with this association is in the following JSON format:\n " + context_table.evidence.astype('str') + "\n\n"                
                 node_context_extracted = context_table.context.str.cat(sep=' ')
             else:
+                #
                 node_context_extracted += ". ".join(high_similarity_context)
                 node_context_extracted += ". "
+        #
         return node_context_extracted
     
     

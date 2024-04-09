@@ -16,7 +16,7 @@ print("")
 
 user_input = input("Did you update the config.yaml file with all necessary configurations (such as GPT .env path, vectorDB file paths, other file paths)? Enter Y or N: ")
 print("")
-if user_input == "Y":
+if user_input.strip().upper() == "Y":
     print("Checking disease vectorDB ...")
     try:
         if os.path.exists(config_data["VECTOR_DB_PATH"]):
